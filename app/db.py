@@ -98,6 +98,24 @@ def initialise() -> None:
                 FOREIGN KEY (target_stream_id) REFERENCES streams(stream_id)
             );
 
+            -- One row per completed reversal: reversal_id is the global
+            -- idempotency key, and (stream_id, event_id) is unique so each
+            -- event can be reversed at most once. reversal_sequence records
+            -- where the compensation event (event id
+            -- `reversal:<reversal_id>`, delta = -original delta) was appended
+            -- so an idempotent replay can return the original coordinates.
+            CREATE TABLE IF NOT EXISTS reversals (
+                reversal_id       TEXT PRIMARY KEY,
+                stream_id         TEXT    NOT NULL,
+                event_id          TEXT    NOT NULL,
+                reversal_event_id TEXT    NOT NULL,
+                reversal_sequence INTEGER NOT NULL CHECK (reversal_sequence >= 0),
+                delta             INTEGER NOT NULL,
+                UNIQUE (stream_id, event_id),
+                FOREIGN KEY (stream_id, event_id)
+                    REFERENCES events(stream_id, event_id)
+            );
+
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
             -- NULL (no lease) or all set together.
