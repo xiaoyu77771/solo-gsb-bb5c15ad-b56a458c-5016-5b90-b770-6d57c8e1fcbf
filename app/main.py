@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import consumers, db, forks, repo, transfers
+from . import consumers, db, forks, repo, reversals, transfers
 
 
 @asynccontextmanager
@@ -194,6 +194,40 @@ class TransferOut(BaseModel):
     target: TransferSideOut
 
 
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(
+        ..., min_length=1, description="Client-assigned global idempotency key"
+    )
+
+    @field_validator("reversal_id")
+    @classmethod
+    def _reject_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    model_config = {
+        "json_schema_extra": {"examples": [{"reversal_id": "rev-1"}]}
+    }
+
+
+class ReversalOut(BaseModel):
+    status: str
+    replayed: bool
+    reversal_id: str
+    stream_id: str
+    original_event_id: str
+    original_sequence: int = Field(..., description="Sequence of the reversed event")
+    original_delta: int = Field(..., description="Delta of the reversed event")
+    reversal_event_id: str
+    reversal_sequence: int = Field(
+        ..., description="Sequence the compensating event was appended at"
+    )
+    state: StreamStateOut = Field(
+        ..., description="Latest state of the stream after applying the reversal"
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -245,6 +279,51 @@ def get_stream(stream_id: str) -> StreamStateOut:
             detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
         )
     return StreamStateOut(**state.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/events/{event_id}/reversals",
+    response_model=ReversalOut,
+    status_code=201,
+    responses={200: {"model": ReversalOut, "description": "Idempotent replay of an existing reversal"}},
+    tags=["events"],
+    summary="Reverse an applied event by appending a compensating event",
+)
+def reverse_event(stream_id: str, event_id: str, body: ReversalIn):
+    try:
+        result = reversals.create_reversal(stream_id, event_id, body.reversal_id)
+    except reversals.ReversalError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: UNIQUE(reversal_id), UNIQUE(stream_id,
+        # original_event_id) and the events UNIQUE constraints map to a 409.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+
+    payload = ReversalOut(
+        status="ok",
+        replayed=result.replayed,
+        reversal_id=result.reversal_id,
+        stream_id=result.stream_id,
+        original_event_id=result.original_event_id,
+        original_sequence=result.original_sequence,
+        original_delta=result.original_delta,
+        reversal_event_id=result.reversal_event_id,
+        reversal_sequence=result.reversal_sequence,
+        state=StreamStateOut(**result.state.as_dict()),
+    ).model_dump()
+    # Idempotent replays return 200; first-time reversals return 201.
+    return JSONResponse(payload, status_code=200 if result.replayed else 201)
 
 
 @app.post(

@@ -893,3 +893,299 @@ def test_transfer_coexists_with_forks_and_consumers(client):
     ]
     assert _ack(client, "t-mix-a", "worker", batch["lease_token"]).json()["cursor"] == 2
     assert _claim(client, "t-mix-a", "worker", 10).json()["events"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Event reversals
+# --------------------------------------------------------------------------- #
+
+
+def _reverse(client, stream_id, event_id, reversal_id):
+    return client.post(
+        f"/streams/{stream_id}/events/{event_id}/reversals",
+        json={"reversal_id": reversal_id},
+    )
+
+
+def _seed_events(client, stream_id, deltas):
+    for seq, delta in enumerate(deltas):
+        r = _post(client, stream_id, f"{stream_id}-e{seq}", seq, delta)
+        assert r.status_code in (200, 201)
+
+
+def test_reversal_appends_negated_delta_at_next_sequence(client):
+    _seed_events(client, "r-basic", [100, -30, 20])  # balance 90, next 3
+
+    r = _reverse(client, "r-basic", "r-basic-e1", "rev-1")
+    assert r.status_code == 201
+    body = r.json()
+    assert body == {
+        "status": "ok",
+        "replayed": False,
+        "reversal_id": "rev-1",
+        "stream_id": "r-basic",
+        "original_event_id": "r-basic-e1",
+        "original_sequence": 1,
+        "original_delta": -30,
+        "reversal_event_id": "reversal:rev-1",
+        "reversal_sequence": 3,
+        "state": {
+            "stream_id": "r-basic",
+            "balance": 120,  # 90 - (-30)
+            "next_sequence": 4,
+            "pending_sequences": [],
+        },
+    }
+    assert client.get("/streams/r-basic").json()["balance"] == 120
+
+
+def test_reversal_replay_same_target_returns_200_and_latest_state(client):
+    _seed_events(client, "r-rep", [100, 50])
+    first = _reverse(client, "r-rep", "r-rep-e1", "rep-rev")
+    assert first.status_code == 201
+
+    # Another event lands before the replay: it must surface in the latest state.
+    _post(client, "r-rep", "later", 3, 5)
+
+    second = _reverse(client, "r-rep", "r-rep-e1", "rep-rev")
+    assert second.status_code == 200
+    body = second.json()
+    assert body["replayed"] is True
+    assert body["reversal_sequence"] == 2
+    assert body["original_sequence"] == 1
+    assert body["state"] == {
+        "stream_id": "r-rep",
+        "balance": 105,
+        "next_sequence": 4,
+        "pending_sequences": [],
+    }
+    # Exactly one compensating event exists; balance was compensated once.
+    assert client.get("/streams/r-rep").json()["balance"] == 105
+    batch = _claim(client, "r-rep", "worker", 100).json()
+    assert [(e["sequence"], e["event_id"]) for e in batch["events"]] == [
+        (0, "r-rep-e0"),
+        (1, "r-rep-e1"),
+        (2, "reversal:rep-rev"),
+        (3, "later"),
+    ]
+
+
+def test_reversal_replay_different_target_returns_409(client):
+    _seed_events(client, "r-a", [100])
+    _seed_events(client, "r-b", [100])
+    assert _reverse(client, "r-a", "r-a-e0", "shared-rev").status_code == 201
+
+    # Same reversal_id, different event of the same stream.
+    r = _reverse(client, "r-a", "r-a-other", "shared-rev")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "reversal_replay_conflict"
+
+    # Same reversal_id, different stream.
+    r = _reverse(client, "r-b", "r-b-e0", "shared-rev")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "reversal_replay_conflict"
+
+    # The clashing retries changed nothing.
+    assert client.get("/streams/r-a").json()["next_sequence"] == 2
+    assert client.get("/streams/r-b").json()["balance"] == 100
+
+
+def test_reversing_same_event_with_new_id_returns_409(client):
+    _seed_events(client, "r-twice", [100, 10])
+    assert _reverse(client, "r-twice", "r-twice-e0", "first-rev").status_code == 201
+
+    r = _reverse(client, "r-twice", "r-twice-e0", "second-rev")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "event_already_reversed"
+    # Only one compensation event was appended.
+    state = client.get("/streams/r-twice").json()
+    assert state["next_sequence"] == 3
+    assert state["balance"] == 10
+
+
+def test_reversal_unknown_stream_returns_404(client):
+    r = _reverse(client, "r-no-stream", "e0", "rev-404s")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+    # The reversal request must not auto-create the stream.
+    assert client.get("/streams/r-no-stream").status_code == 404
+
+
+def test_reversal_unknown_event_returns_404(client):
+    _seed_events(client, "r-no-event", [100])
+    r = _reverse(client, "r-no-event", "ghost-event", "rev-404e")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "event_not_found"
+    assert client.get("/streams/r-no-event").json()["next_sequence"] == 1
+
+
+def test_reversal_unapplied_event_returns_409(client):
+    # Sequence 1 is buffered behind the gap at 0.
+    _post(client, "r-pending", "pe1", 1, 10)
+    r = _reverse(client, "r-pending", "pe1", "rev-pending")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "event_not_applied"
+    # Nothing was appended while the event was unapplied.
+    assert client.get("/streams/r-pending").json()["pending_sequences"] == [1]
+
+    # After the gap closes it is applied and becomes reversible.
+    _post(client, "r-pending", "pe0", 0, 100)
+    r = _reverse(client, "r-pending", "pe1", "rev-pending")
+    assert r.status_code == 201
+    assert r.json()["state"]["balance"] == 100  # 100 + 10 - 10
+    assert r.json()["reversal_sequence"] == 2
+
+
+def test_reversal_unblocks_buffered_events(client):
+    # next_sequence = 2; events 3 and 4 are parked behind the gap at 2.
+    _seed_events(client, "r-gap", [100, 20])
+    _post(client, "r-gap", "parked3", 3, 7)
+    _post(client, "r-gap", "parked4", 4, 2)
+    assert client.get("/streams/r-gap").json()["pending_sequences"] == [3, 4]
+
+    # The reversal fills sequence 2; contiguous catch-up then applies it and
+    # unblocks the parked run 3 -> 4 in the same transaction.
+    r = _reverse(client, "r-gap", "r-gap-e1", "rev-gap")
+    assert r.status_code == 201
+    state = r.json()["state"]
+    assert state == {
+        "stream_id": "r-gap",
+        "balance": 109,  # 100 + 20 - 20 (reversal) + 7 + 2
+        "next_sequence": 5,
+        "pending_sequences": [],
+    }
+
+
+def test_reversal_with_remaining_gap_keeps_later_events_pending(client):
+    # next_sequence = 2; only sequence 4 is parked (gaps at 2 and 3). The
+    # reversal consumes 2, gap 3 remains and sequence 4 stays buffered.
+    _seed_events(client, "r-gap2", [100, 20])
+    _post(client, "r-gap2", "parked4", 4, 7)
+
+    r = _reverse(client, "r-gap2", "r-gap2-e1", "rev-gap2")
+    assert r.status_code == 201
+    state = r.json()["state"]
+    assert state["balance"] == 100 and state["next_sequence"] == 3
+    assert state["pending_sequences"] == [4]
+
+    # Closing the remaining gap applies the parked event normally.
+    _post(client, "r-gap2", "closer", 3, 3)
+    assert client.get("/streams/r-gap2").json()["balance"] == 110
+
+
+def test_reversal_event_is_consumable_through_claim(client):
+    _seed_events(client, "r-consume", [100, -40, 5])
+    assert _reverse(client, "r-consume", "r-consume-e1", "rev-cons").status_code == 201
+
+    batch = _claim(client, "r-consume", "worker", 100).json()
+    assert [(e["event_id"], e["sequence"], e["delta"]) for e in batch["events"]] == [
+        ("r-consume-e0", 0, 100),
+        ("r-consume-e1", 1, -40),
+        ("r-consume-e2", 2, 5),
+        ("reversal:rev-cons", 3, 40),
+    ]
+    assert _ack(client, "r-consume", "worker", batch["lease_token"]).json()["cursor"] == 4
+    assert _claim(client, "r-consume", "worker", 10).json()["events"] == []
+
+
+def test_reversal_event_is_visible_to_fork(client):
+    _seed_events(client, "r-fork", [100, -30, 20])
+    assert _reverse(client, "r-fork", "r-fork-e1", "rev-fork").status_code == 201
+
+    # Fork the prefix ending at (but excluding) the original ... include all 4.
+    r = _fork(client, "r-fork", "fork-rev", "r-fork-copy", 4)
+    assert r.status_code == 201
+    assert r.json()["balance"] == 120 and r.json()["next_sequence"] == 4
+    batch = _claim(client, "r-fork-copy", "worker", 100).json()
+    assert [(e["sequence"], e["delta"]) for e in batch["events"]] == [
+        (0, 100), (1, -30), (2, 20), (3, 30)
+    ]
+
+
+def test_reversal_of_a_reversal_event(client):
+    _seed_events(client, "r-rr", [100])
+    first = _reverse(client, "r-rr", "r-rr-e0", "rev-a")
+    assert first.status_code == 201
+    assert first.json()["state"]["balance"] == 0
+
+    # The compensating event is itself an ordinary applied event.
+    second = _reverse(client, "r-rr", "reversal:rev-a", "rev-b")
+    assert second.status_code == 201
+    body = second.json()
+    assert body["original_delta"] == -100
+    assert body["reversal_event_id"] == "reversal:rev-b"
+    assert body["reversal_sequence"] == 2
+    assert body["state"]["balance"] == 100
+
+
+def test_reversal_validation_rejects_bad_payloads(client):
+    _seed_events(client, "r-val", [1])
+    url = "/streams/r-val/events/r-val-e0/reversals"
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"reversal_id": ""}).status_code == 422
+    assert client.post(url, json={"reversal_id": "   "}).status_code == 422
+    assert client.post(url, json={"reversal_id": 123}).status_code == 422
+    assert client.post(url, json={"reversal_id": True}).status_code == 422
+
+
+def test_concurrent_reversal_retries_commit_exactly_once(client):
+    import threading
+
+    _seed_events(client, "r-race", [100, 10, 10])
+    statuses: list[int] = []
+
+    def do_reverse():
+        r = _reverse(client, "r-race", "r-race-e1", "race-rev")
+        statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=do_reverse) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses) == [200] * 19 + [201]
+    state = client.get("/streams/r-race").json()
+    assert state["balance"] == 110  # compensated once
+    assert state["next_sequence"] == 4
+    batch = _claim(client, "r-race", "worker", 100).json()
+    assert [e["sequence"] for e in batch["events"]] == [0, 1, 2, 3]
+    assert batch["events"][3]["event_id"] == "reversal:race-rev"
+
+
+def test_concurrent_distinct_reversal_ids_never_double_compensate(client):
+    import threading
+
+    _seed_events(client, "r-race2", [100])
+    codes: list[str] = []
+
+    def do_reverse(i):
+        r = _reverse(client, "r-race2", "r-race2-e0", f"race-rev-{i}")
+        if r.status_code != 201:
+            codes.append(r.json()["detail"]["code"])
+
+    threads = [threading.Thread(target=do_reverse, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(codes) == 19
+    assert set(codes) == {"event_already_reversed"}
+    state = client.get("/streams/r-race2").json()
+    assert state["balance"] == 0 and state["next_sequence"] == 2
+    batch = _claim(client, "r-race2", "worker", 100).json()
+    assert [e["sequence"] for e in batch["events"]] == [0, 1]
+
+
+def test_reversal_coexists_with_transfers(client):
+    _seed_balance(client, "r-mix-a", 100)
+    _seed_balance(client, "r-mix-b", 0)
+    assert _transfer(client, "txn-mix-r", "r-mix-a", "r-mix-b", 40).status_code == 201
+    # r-mix-a: seed +100 @0, debit -40 @1 -> balance 60
+    r = _reverse(client, "r-mix-a", "transfer:txn-mix-r:debit", "rev-txn")
+    assert r.status_code == 201
+    assert r.json()["reversal_sequence"] == 2
+    assert r.json()["state"]["balance"] == 100
+    # The credited stream is untouched by the reversal.
+    assert client.get("/streams/r-mix-b").json()["balance"] == 40

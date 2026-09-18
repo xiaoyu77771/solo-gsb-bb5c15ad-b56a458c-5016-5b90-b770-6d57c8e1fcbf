@@ -31,6 +31,13 @@
   `BEGIN IMMEDIATE` 事务**内完成连续应用与余额更新，任一步失败整体回滚。相同
   `transfer_id` 携带相同参数重试返回原结果且不重复扣款，参数不一致返回 `409`，
   并发重试只提交一次。
+- **事件撤销（reversal）**：`POST /streams/{stream_id}/events/{event_id}/reversals`
+  以全局幂等键 `reversal_id` 撤销该流中一条**已应用且尚未被撤销**的事件：在当前
+  `next_sequence` 追加一条 `event_id=reversal:{reversal_id}`、`delta=-原 delta` 的
+  **普通事件**，并在**同一个 `BEGIN IMMEDIATE` 事务**内完成连续应用、状态更新与
+  撤销记录。相同目标重放返回 `200` 及最新状态；相同 `reversal_id` 换目标、同一原
+  事件换 `reversal_id` 再次撤销均返回 `409`，并发也绝不会重复补偿。撤销事件是普通
+  事件，可被消费（claim/ack）与分叉（fork）等既有接口观察到。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -274,6 +281,65 @@ fork 等既有接口正常观察和处理。
 }
 ```
 
+### 7. 撤销已应用事件（reversal）
+
+```
+POST /streams/{stream_id}/events/{event_id}/reversals
+Content-Type: application/json
+```
+
+路径参数 `event_id` 为待撤销的原事件；请求体：
+
+| 字段          | 类型   | 约束            | 说明                                 |
+| ------------- | ------ | --------------- | ------------------------------------ |
+| `reversal_id` | string | 非空，**全局**唯一 | 客户端分配的全局幂等键（重试键）     |
+
+只允许撤销**该流中已应用（`applied=1`）且尚未被撤销**的事件。撤销在**同一个
+`BEGIN IMMEDIATE` 事务**内完成：
+
+1. 在该流当前 `next_sequence` 追加一条普通事件：
+   `event_id = reversal:<reversal_id>`、`delta = -原事件 delta`；
+2. 执行普通的连续追赶（catch-up）——若追加位置之前还有因缺号暂存的事件链，这次
+   追加也会把它们一并连续应用；
+3. 更新流的 `balance`/`next_sequence` 并写入 `reversals` 撤销记录，统一提交。
+
+任一步失败整体回滚，**不会留下任何补偿事件或余额变化**。撤销事件就是普通事件：
+随后可以通过 `GET /streams/{id}`、消费 claim/ack、fork 等既有接口正常观察和处理。
+
+- `201 Created`：撤销首次提交；
+- `200 OK`：相同 `reversal_id` 对**完全相同的目标**（同一流、同一原事件）幂等
+  重试，返回原补偿事件序号与该流的**最新**状态（重试不会再次补偿）；
+- `409 Conflict`：
+  - `reversal_replay_conflict`：相同 `reversal_id` 重试时目标流或原事件 id 与首次
+    不同（`reversal_id` 是全局幂等键，不区分流）；
+  - `event_already_reversed`：该原事件已经被**另一个** `reversal_id` 撤销过
+    （同一原事件最多补偿一次）；
+  - `event_not_applied`：原事件存在但尚未应用（仍因缺号暂存在
+    `pending_sequences` 中）；
+- `404 Not Found`：`stream_not_found`（流不存在，不会自动建流）或
+  `event_not_found`（流存在但没有这个 `event_id`）；
+- `422 Unprocessable Entity`：请求体字段校验失败（如 `reversal_id` 为空）。
+
+并发的相同 `reversal_id` 请求在写锁上串行：恰好一个得到 `201`，其余全部拿到
+`200` 原结果；并发地用**不同** `reversal_id` 撤销同一原事件时，
+`UNIQUE (stream_id, original_event_id)` 约束保证只有一个成功，其余得到
+`409 event_already_reversed`——数据库中只有一条补偿事件，绝不会重复补偿。
+
+```json
+{
+  "status": "ok",
+  "replayed": false,
+  "reversal_id": "rev-1",
+  "stream_id": "acct-1",
+  "original_event_id": "e1",
+  "original_sequence": 1,
+  "original_delta": -30,
+  "reversal_event_id": "reversal:rev-1",
+  "reversal_sequence": 3,
+  "state": {"stream_id": "acct-1", "balance": 120, "next_sequence": 4, "pending_sequences": []}
+}
+```
+
 ## 工作机制示例
 
 ```bash
@@ -472,6 +538,66 @@ curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
 # -> events 最后一项为 {"event_id":"transfer:txn-1:debit","sequence":3,"delta":-50}
 ```
 
+## 事件撤销示例（reversal）
+
+```bash
+# 准备：acct-r 有两个已应用事件（balance=70, next_sequence=2）
+curl -s -X POST localhost:8000/streams/acct-r/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e0","sequence":0,"delta":100}'
+curl -s -X POST localhost:8000/streams/acct-r/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e1","sequence":1,"delta":-30}'
+
+# 撤销 e1：在 next_sequence=2 追加 event_id=reversal:rev-1, delta=30 的普通事件
+curl -s -X POST localhost:8000/streams/acct-r/events/e1/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-1"}'
+# 201:
+# {"status":"ok","replayed":false,"reversal_id":"rev-1",
+#  "stream_id":"acct-r","original_event_id":"e1",
+#  "original_sequence":1,"original_delta":-30,
+#  "reversal_event_id":"reversal:rev-1","reversal_sequence":2,
+#  "state":{"stream_id":"acct-r","balance":100,"next_sequence":3,"pending_sequences":[]}}
+
+# 相同 reversal_id + 相同目标重试：幂等，返回 200 与最新状态，不再补偿
+curl -s -i -X POST localhost:8000/streams/acct-r/events/e1/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-1"}'
+# HTTP/1.1 200 OK -> replayed=true, reversal_sequence 仍为 2
+
+# 同一原事件换一个 reversal_id 再撤销：409 event_already_reversed
+curl -s -i -X POST localhost:8000/streams/acct-r/events/e1/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-2"}'
+# HTTP/1.1 409
+
+# 相同 reversal_id 指向不同目标：409 reversal_replay_conflict
+curl -s -i -X POST localhost:8000/streams/acct-r/events/e0/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-1"}'
+# HTTP/1.1 409
+
+# 撤销尚未应用（因缺号暂存）的事件：409 event_not_applied
+curl -s -X POST localhost:8000/streams/acct-p/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"p1","sequence":1,"delta":10}'   # 缺 0，暂存
+curl -s -i -X POST localhost:8000/streams/acct-p/events/p1/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-p"}'
+# HTTP/1.1 409
+
+# 流不存在：404 stream_not_found（不会自动建流）
+curl -s -i -X POST localhost:8000/streams/ghost/events/e0/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-x"}'
+# HTTP/1.1 404
+
+# 事件不存在：404 event_not_found
+curl -s -i -X POST localhost:8000/streams/acct-r/events/nope/reversals \
+  -H 'Content-Type: application/json' -d '{"reversal_id":"rev-y"}'
+# HTTP/1.1 404
+
+# 撤销事件是普通事件：消费者可以在 sequence=2 领取到 reversal:rev-1
+curl -s -X POST localhost:8000/streams/acct-r/consumers/worker/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}'
+# -> events 最后一项为 {"event_id":"reversal:rev-1","sequence":2,"delta":30}
+```
+
 ## 数据模型
 
 ```text
@@ -483,6 +609,9 @@ forks(source_stream_id, fork_id, target_stream_id, through_sequence, balance,
 transfers(transfer_id PK, source_stream_id, target_stream_id, amount,
           source_sequence, target_sequence,
           CHECK(amount > 0), CHECK(source_stream_id <> target_stream_id))
+reversals(reversal_id PK, stream_id, original_event_id, original_sequence,
+          original_delta, reversal_sequence,
+          UNIQUE(stream_id, original_event_id))
 consumers(stream_id, consumer_id, cursor_seq,
           lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
           PK(stream_id, consumer_id))
@@ -495,6 +624,13 @@ consumers(stream_id, consumer_id, cursor_seq,
   重试按 `transfer_id` 比对参数，`source_sequence`/`target_sequence` 即原扣款/入账
   事件的追加位置；转账事件本身仍是 `events` 表中的普通行，事件 id 形如
   `transfer:<transfer_id>:debit|credit`，`events` 的两个唯一约束为其兜底；
+- `reversals` 以全局 `reversal_id` 为主键记录每次已提交撤销的目标
+  （`stream_id`/`original_event_id`）、原事件序号与原 `delta`、以及补偿事件的追加
+  位置 `reversal_sequence`：重试按 `reversal_id` 比对目标；
+  `UNIQUE (stream_id, original_event_id)` 保证一条原事件至多被撤销一次（换一个
+  `reversal_id` 重试或并发撤销都得到 `409`），并有指向 `events` 的复合外键兜底。
+  补偿事件本身仍是 `events` 表中的普通行，事件 id 形如 `reversal:<reversal_id>`，
+  `delta` 为原 `delta` 的相反数；
 - 每个 `(stream_id, consumer_id)` 一行：`cursor_seq` 为消费游标（下一个待领取
   的序号），租约四列要么整体为 NULL（无有效租约），要么整体非空。一行只持有一个
   租约，因此领取与确认都在 `BEGIN IMMEDIATE` 事务内串行执行——即使多个应用实例
@@ -560,6 +696,30 @@ consumers(stream_id, consumer_id, cursor_seq,
 拿到锁的请求完成插入并提交，其余请求随后读到既有记录，按幂等回放返回，因此
 `transfers` 中只有一行、两侧各只有一条转账事件。
 
+撤销的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 按 `reversal_id` 查 `reversals`：已存在则比对目标流与原事件 id，不一致返回
+   `409 reversal_replay_conflict`，一致则回放原结果（`200`）——返回记录中的原始
+   事件序号与补偿事件序号，并重新读取该流**当前**状态一并返回，不做第二次补偿；
+2. 首次请求：读取流，不存在直接返回 `404 stream_not_found`（事务内不做任何写入，
+   撤销不会像提交事件那样自动建流）；按 `(stream_id, event_id)` 查原事件，不存在
+   返回 `404 event_not_found`；
+3. 原事件 `applied=0`（因缺号暂存）返回 `409 event_not_applied`；按
+   `(stream_id, original_event_id)` 查既有撤销记录，已被其他 `reversal_id` 撤销则
+   返回 `409 event_already_reversed`；
+4. 在流当前 `next_sequence` 插入补偿事件（`applied=0`，
+   `event_id=reversal:<reversal_id>`，`delta=-原 delta`），执行普通连续追赶：补偿
+   事件（以及因此解除缺号的暂存事件链）依次累加并标记 `applied=1`；
+5. 更新流 `balance`/`next_sequence`，写入 `reversals` 记录（含原事件序号、原
+   `delta` 与补偿事件序号），统一提交——任一步失败整体回滚，补偿事件与余额都不会
+   残留。
+
+并发撤销同一原事件时，多个请求在 `BEGIN IMMEDIATE` 写锁上排队：相同
+`reversal_id` 的并发重试只有一个 `201`，其余读到既有记录返回 `200`；不同
+`reversal_id` 的并发撤销由 `reversals` 的
+`UNIQUE (stream_id, original_event_id)` 约束兜底，除第一个外全部得到
+`409 event_already_reversed`，`events` 中只有一条补偿事件。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -586,7 +746,13 @@ token 的三种 409、租约到期后同批重新领取、多消费者独立游�
 响应字段、事件可被 claim 消费、恰好足额、余额不足 `422` 且无副作用、源流/目标流
 缺失 `404`、相同参数重试 `200` 返回原序号且不重复扣款、重试时返回最新流状态、
 参数漂移 `409`、请求体 `422`、暂存事件在转账时一并追赶、与 fork/消费者接口共存，
-以及 20 线程并发（同一 `transfer_id` 只提交一次；50 笔不同转账串行提交且总额守恒）。
+以及 20 线程并发（同一 `transfer_id` 只提交一次；50 笔不同转账串行提交且总额守恒）；
+事件撤销部分覆盖：补偿事件取负原 `delta` 追加在 `next_sequence`、相同目标重放
+`200` 返回最新状态、`reversal_id` 换目标 `409`、同一原事件换 id 再撤销 `409`、
+流/事件不存在的两种 `404`、未应用事件 `409`、撤销解除缺号暂存、剩余缺号时后续事件
+仍暂存、撤销事件可被 claim 消费与 fork 复制、撤销可再被撤销、请求体 `422`、与转账
+共存，以及 20 线程并发（同一 `reversal_id` 只补偿一次；20 个不同 `reversal_id`
+争抢同一原事件时只有一个成功）。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
@@ -594,6 +760,7 @@ token 的三种 409、租约到期后同批重新领取、多消费者独立游�
 python3 verify_core.py
 python3 verify_forks.py
 python3 verify_transfers.py
+python3 verify_reversals.py
 ```
 
 ## 项目结构
@@ -606,6 +773,7 @@ python3 verify_transfers.py
 │   ├── repo.py        # 归并/追赶算法（纯 sqlite3，事务边界清晰）
 │   ├── forks.py       # 流分叉（fork）幂等事务
 │   ├── transfers.py   # 跨事件流原子转账（transfer）幂等事务
+│   ├── reversals.py   # 事件撤销（reversal）幂等事务
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
@@ -613,6 +781,7 @@ python3 verify_transfers.py
 ├── verify_core.py
 ├── verify_forks.py
 ├── verify_transfers.py
+├── verify_reversals.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
